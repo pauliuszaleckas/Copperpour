@@ -9,6 +9,8 @@ mod board_source;
 #[cfg(test)]
 mod board_source_contract_tests;
 mod board_stackup;
+#[cfg(test)]
+mod board_title_block_tests;
 pub mod cli;
 pub mod config;
 #[cfg(test)]
