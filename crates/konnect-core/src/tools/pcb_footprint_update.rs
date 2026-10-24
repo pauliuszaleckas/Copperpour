@@ -1436,7 +1436,7 @@ fn build_updated_instance(
                 library_field,
                 &position,
                 rotation,
-                is_back,
+                is_back.then_some(stack),
                 text_reset,
             )? {
                 *placed = Some(field);
@@ -1471,12 +1471,12 @@ fn reset_field_effects(
     library: &kiapi::board::types::Field,
     footprint_position: &kiapi::common::types::Vector2,
     footprint_rotation: f64,
-    is_back: bool,
+    mirror: Option<CopperStack>,
     text_reset: TextReset,
 ) -> Result<Option<(kiapi::board::types::Field, FieldEffectsChange)>> {
     let placed = placed.with_context(|| format!("placed footprint has no {name} field"))?;
     let library =
-        transform_library_property(library, footprint_position, footprint_rotation, is_back)?;
+        transform_library_property(library, footprint_position, footprint_rotation, mirror)?;
     let library_text = library
         .text
         .as_ref()
@@ -2680,6 +2680,7 @@ mod tests {
                 eight,
                 &nets,
                 &BTreeSet::new(),
+                TextReset::default(),
             )
             .unwrap();
             let updated =
@@ -2714,6 +2715,7 @@ mod tests {
             two_layers(),
             &nets,
             &BTreeSet::new(),
+            TextReset::default(),
         )
         .unwrap_err();
         assert!(
@@ -3420,16 +3422,15 @@ mod tests {
         let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
         let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
         let routed = BTreeSet::new();
-        let applied =
-            build_updated_instance(
-                &current,
-                &base,
-                two_layers(),
-                &net_codes,
-                &routed,
-                TextReset::default(),
-            )
-            .unwrap();
+        let applied = build_updated_instance(
+            &current,
+            &base,
+            two_layers(),
+            &net_codes,
+            &routed,
+            TextReset::default(),
+        )
+        .unwrap();
         let applied =
             kiapi::board::types::FootprintInstance::decode(applied.item.value.as_slice()).unwrap();
         let changed_source =
@@ -3902,6 +3903,7 @@ mod tests {
         let prepared = build_updated_instance(
             current,
             &library,
+            two_layers(),
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
             text_reset,
@@ -4123,6 +4125,7 @@ mod tests {
             plan_updates(
                 &board,
                 &items,
+                two_layers(),
                 &BTreeMap::new(),
                 &BTreeSet::new(),
                 &UpdateFilters {
