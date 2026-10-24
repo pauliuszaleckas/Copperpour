@@ -2184,7 +2184,7 @@ fn apply_library_fields(
         .map(|angle| angle.value_degrees)
         .unwrap_or(0.0);
     let place = |field: &konnect_ipc::gen::kiapi::board::types::Field| {
-        super::pcb_footprint_update::transform_library_property(field, &position, rotation, false)
+        super::pcb_footprint_update::transform_library_property(field, &position, rotation, None)
     };
     let definition = footprint
         .definition
@@ -6142,7 +6142,13 @@ mod tests {
     /// from #799: both read it off the plan made against the snapshot.
     #[tokio::test]
     async fn the_apply_reports_staging_as_the_dry_run_does() {
-        let served = ServedSync::build(None, kicad_10_refusals(), Readback::AsSent).await;
+        let served = ServedSync::build(
+            None,
+            kicad_10_refusals(),
+            Readback::AsSent,
+            HeldBoard::default(),
+        )
+        .await;
         let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]);
 
         let planned = served.dry_run(&netlist).await;
