@@ -3688,8 +3688,10 @@ mod tests {
             let prepared = build_updated_instance(
                 &kiapi::board::types::FootprintInstance::decode(bytes).unwrap(),
                 &library,
+                two_layers(),
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                TextReset::default(),
             )
             .unwrap();
             assert!(
@@ -3709,8 +3711,10 @@ mod tests {
         let prepared = build_updated_instance(
             &c_0603_capture("loaded_front_180"),
             &library,
+            two_layers(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            TextReset::default(),
         )
         .unwrap();
         let updated =
