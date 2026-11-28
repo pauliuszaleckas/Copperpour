@@ -15,7 +15,7 @@ use crate::tools::sch_connectivity::{
     net_graph_for, saved_power_labels, schematic_pin_endpoint, NetRoot,
 };
 use crate::tools::sch_hierarchy::{commit_sheets, load_saved_hierarchy, SavedHierarchy};
-use crate::tools::sch_wiring::{same_point, LABEL_TAGS};
+use crate::tools::sch_wiring::{same_point, stale_item, LABEL_TAGS};
 use crate::tools::{
     get_path, invalid_arg, opt_str, require_f64, require_str, ToolContext, ToolDef,
 };
@@ -1243,26 +1243,34 @@ impl Design {
         };
         let hierarchy = load_saved_hierarchy(&root).map_err(|error| error.into_tool_result())?;
         let canonical = schematic.canonicalize().map_err(|error| {
-            CallToolResult::error(format!("Cannot read '{}': {error}", schematic.display()))
+            CallToolResult::error_kind(
+                ToolErrorKind::file_not_found(schematic),
+                format!("Cannot read '{}': {error}", schematic.display()),
+            )
         })?;
         let given = hierarchy
             .files
             .iter()
             .position(|f| f.canonical == canonical)
             .ok_or_else(|| {
-                CallToolResult::error(format!(
-                    "'{}' is not a sheet of the hierarchy under '{}'",
-                    schematic.display(),
-                    root.display()
-                ))
+                // As `resolve_schematic_ownership` refuses an unlinked sheet.
+                CallToolResult::error_kind(
+                    ToolErrorKind::Conflict {
+                        paths: vec![schematic.display().to_string(), root.display().to_string()],
+                    },
+                    format!(
+                        "'{}' is not a sheet of the hierarchy under '{}'",
+                        schematic.display(),
+                        root.display()
+                    ),
+                )
             })?;
         let mut contents = Vec::with_capacity(hierarchy.files.len());
         for file in &hierarchy.files {
             contents.push(read_contents(&file.content, &file.tree).map_err(|reason| {
-                CallToolResult::error(format!(
-                    "Cannot read the labels of '{}': {reason}",
-                    file.path.display()
-                ))
+                let path = file.path.display().to_string();
+                let message = format!("Cannot read the labels of '{path}': {reason}");
+                CallToolResult::error_kind(ToolErrorKind::MalformedFile { path, reason }, message)
             })?);
         }
         let instances = instances_of(&hierarchy, &contents);
@@ -1324,9 +1332,10 @@ impl Design {
                     .iter()
                     .position(|l| l.uuid.as_deref() == Some(uuid))
                     .ok_or_else(|| {
-                        CallToolResult::error(format!(
-                            "No label with uuid '{uuid}' in this schematic"
-                        ))
+                        stale_item(
+                            format!("label {uuid}"),
+                            format!("No label with uuid '{uuid}' in this schematic"),
+                        )
                     })?;
                 Ok((
                     checked_name("uuid", &labels[k].name)?,
@@ -1338,9 +1347,10 @@ impl Design {
                     .filter(|&k| stored_name(&labels[k].name) == *net)
                     .collect();
                 if named.is_empty() {
-                    return Err(CallToolResult::error(format!(
-                        "No label named '{net}' in this schematic"
-                    )));
+                    return Err(stale_item(
+                        format!("label '{net}' at ({x}, {y})"),
+                        format!("No label named '{net}' in this schematic"),
+                    ));
                 }
                 let here: Vec<usize> = named
                     .iter()
@@ -1354,11 +1364,14 @@ impl Design {
                             .iter()
                             .map(|&k| format!("{} at ({}, {})", labels[k].tag, labels[k].x, labels[k].y))
                             .collect();
-                        Err(CallToolResult::error(format!(
-                            "No label '{net}' at ({x}, {y}). Found {} label(s) named '{net}': {}",
-                            named.len(),
-                            found.join("; ")
-                        )))
+                        Err(stale_item(
+                            format!("label '{net}' at ({x}, {y})"),
+                            format!(
+                                "No label '{net}' at ({x}, {y}). Found {} label(s) named '{net}': {}",
+                                named.len(),
+                                found.join("; ")
+                            ),
+                        ))
                     }
                     several => Err(CallToolResult::error_kind(
                         ToolErrorKind::AmbiguousTarget {
@@ -1393,9 +1406,10 @@ impl Design {
                     } else {
                         "this schematic"
                     };
-                    return Err(CallToolResult::error(format!(
-                        "No label named '{net}' in {place}"
-                    )));
+                    return Err(stale_item(
+                        format!("label '{net}'"),
+                        format!("No label named '{net}' in {place}"),
+                    ));
                 }
                 Ok((net.clone(), renamed))
             }
@@ -1439,9 +1453,15 @@ impl Design {
                         self.hierarchy.files.iter().map(|f| &f.tree).collect();
                     aliases = Some(bus_aliases(self.project.as_deref(), &sheets).map_err(
                         |reason| {
-                            CallToolResult::error(format!(
-                                "Cannot read the project's bus aliases: {reason}"
-                            ))
+                            let message =
+                                format!("Cannot read the project's bus aliases: {reason}");
+                            // Only reading the `.kicad_pro` fails.
+                            let path = self.project.as_deref().map(Path::display);
+                            let path = path.map(|p| p.to_string()).unwrap_or_default();
+                            CallToolResult::error_kind(
+                                ToolErrorKind::MalformedFile { path, reason },
+                                message,
+                            )
                         },
                     )?);
                 }
@@ -2846,5 +2866,119 @@ mod tests {
             refused(&rename(&root, args.clone()).await, "invalid_argument");
         }
         assert_eq!(read(&dir, ROOT), fixture(ROOT));
+    }
+
+    /// The `error` object of a refusal of `kind`, after checking that
+    /// `message` is still the whole text a plain client shows.
+    fn refusal(result: &CallToolResult, kind: &str, message: &str) -> Value {
+        refused(result, kind);
+        let body: Value = serde_json::from_str(text(result)).unwrap();
+        assert_eq!(body["message"], message);
+        body["error"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_label_the_sheet_does_not_hold_is_a_stale_target() {
+        let dir = single_pin_nets();
+        let root = dir.path().join(ROOT);
+        let uuid = "00000000-0000-4000-8000-000000000000";
+        for (args, target, message) in [
+            (
+                json!({ "uuid": uuid, "new_name": "X" }),
+                format!("label {uuid}"),
+                format!("No label with uuid '{uuid}' in this schematic"),
+            ),
+            (
+                json!({ "net": "NOPE", "x": 1.0, "y": 2.0, "new_name": "X" }),
+                "label 'NOPE' at (1, 2)".to_string(),
+                "No label named 'NOPE' in this schematic".to_string(),
+            ),
+            (
+                json!({ "net": "LONE", "x": 1.0, "y": 2.0, "new_name": "X" }),
+                "label 'LONE' at (1, 2)".to_string(),
+                "No label 'LONE' at (1, 2). Found 2 label(s) named 'LONE': \
+                 label at (95.25, 59.69); label at (76.2, 59.69)"
+                    .to_string(),
+            ),
+            (
+                json!({ "net": "NOPE", "scope": "sheet", "new_name": "X" }),
+                "label 'NOPE'".to_string(),
+                "No label named 'NOPE' in this schematic".to_string(),
+            ),
+            (
+                json!({ "net": "NOPE", "scope": "hierarchy", "new_name": "X" }),
+                "label 'NOPE'".to_string(),
+                "No label named 'NOPE' in this schematic or the sheets below it".to_string(),
+            ),
+        ] {
+            let result = rename(&root, args).await;
+            let error = refusal(&result, "stale_target", &message);
+            assert_eq!(error["target"], target.as_str());
+            assert_eq!(error["reason"], message.as_str());
+        }
+        assert_eq!(read(&dir, ROOT), fixture(ROOT));
+        assert_eq!(read(&dir, CHILD), fixture(CHILD));
+    }
+
+    /// The project's ownership check refuses a sheet its hierarchy does not
+    /// place; `Design::load` types its own later check the same way.
+    #[tokio::test]
+    async fn a_file_outside_the_hierarchy_is_a_conflict() {
+        let dir = single_pin_nets();
+        let orphan = dir.path().join("orphan.kicad_sch");
+        std::fs::write(&orphan, fixture(CHILD)).unwrap();
+        let result = rename(&orphan, json!({ "uuid": CHILD_LOCAL, "new_name": "X" })).await;
+        refused(&result, "conflict");
+        assert_eq!(std::fs::read_to_string(&orphan).unwrap(), fixture(CHILD));
+    }
+
+    #[tokio::test]
+    async fn a_label_without_a_position_is_a_malformed_file() {
+        let dir = single_pin_nets();
+        let root = dir.path().join(ROOT);
+        let placed = "\t(label \"LONE\"\n\t\t(at 95.25 59.69 0)\n";
+        let source = fixture(ROOT);
+        assert_eq!(source.matches(placed).count(), 1);
+        let broken = source.replace(placed, "\t(label \"LONE\"\n");
+        std::fs::write(&root, &broken).unwrap();
+        let result = rename(&root, json!({ "uuid": TWO_PIN, "new_name": "X" })).await;
+        let start = broken.find("\t(label \"LONE\"\n").unwrap() + 1;
+        let reason = format!("a label at byte {start} has no name or position");
+        let message = format!("Cannot read the labels of '{}': {reason}", root.display());
+        let error = refusal(&result, "malformed_file", &message);
+        assert_eq!(error["path"], root.display().to_string());
+        assert_eq!(error["reason"], reason.as_str());
+        assert_eq!(read(&dir, ROOT), broken);
+    }
+
+    #[tokio::test]
+    async fn unreadable_bus_aliases_are_a_malformed_project() {
+        let dir = copied(
+            &[
+                "rigid_block_move_kicad10.kicad_sch",
+                "rigid_block_move_child_kicad10.kicad_sch",
+            ],
+            None,
+        );
+        let project = dir.path().join("rigid_block_move_kicad10.kicad_pro");
+        std::fs::write(&project, "{ not json").unwrap();
+        let sheet = dir.path().join("rigid_block_move_kicad10.kicad_sch");
+        let result = rename(
+            &sheet,
+            json!({ "net": "D0", "scope": "sheet", "new_name": "X" }),
+        )
+        .await;
+        let body: Value =
+            serde_json::from_str(refused(&result, "malformed_file").as_str()).unwrap();
+        assert_eq!(body["error"]["path"], project.display().to_string());
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert_eq!(
+            body["message"],
+            format!("Cannot read the project's bus aliases: {reason}")
+        );
+        assert_eq!(
+            read(&dir, "rigid_block_move_kicad10.kicad_sch"),
+            fixture("rigid_block_move_kicad10.kicad_sch")
+        );
     }
 }

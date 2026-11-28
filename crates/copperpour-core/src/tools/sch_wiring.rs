@@ -1624,7 +1624,7 @@ async fn handle_delete_wire(
 }
 
 /// A `stale_target` refusal: the schematic holds no item `target` names.
-fn stale_item(target: impl Into<String>, message: impl Into<String>) -> CallToolResult {
+pub(crate) fn stale_item(target: impl Into<String>, message: impl Into<String>) -> CallToolResult {
     let message = message.into();
     CallToolResult::error_kind(
         ToolErrorKind::StaleTarget {
