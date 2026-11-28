@@ -1301,6 +1301,7 @@ fn mounting_hole_pad(drill_diameter_mm: f64) -> copperpour_ipc::IpcPadDefinition
         drill_oval: false,
         layers: vec!["*.Cu".to_string(), "*.Mask".to_string()],
         roundrect_ratio: 0.0,
+        metadata: Default::default(),
         custom: None,
     }
 }

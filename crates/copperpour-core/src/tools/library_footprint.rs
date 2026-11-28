@@ -1116,6 +1116,7 @@ pub(crate) fn default_thermal_spoke_angle(shape: i32, anchor: i32) -> f64 {
         PadStackShape::PssRectangle,
         PadStackShape::PssRoundrect,
         PadStackShape::PssChamferedrect,
+        PadStackShape::PssTrapezoid,
     ]
     .into_iter()
     .any(|candidate| candidate as i32 == shape)
@@ -1743,6 +1744,181 @@ fn check_graphic(
     Ok(())
 }
 
+/// Read the native metadata represented by the typed normal padstack. KiCad
+/// stores the nested drill offset on the copper geometry, in pad-local axes.
+pub(super) fn pad_metadata(
+    pad: &SexpNode,
+    shape: &str,
+    file_version: u32,
+) -> Result<copperpour_ipc::IpcPadMetadata> {
+    let mut metadata = copperpour_ipc::IpcPadMetadata {
+        unconnected_layer_removal: if pad.get(2).and_then(SexpNode::as_str) == Some("thru_hole") {
+            pad_annular_mode(pad)?
+        } else {
+            None
+        },
+        ..Default::default()
+    };
+    let mut seen = BTreeSet::new();
+    for clause in pad.children().unwrap_or_default().iter().skip(4) {
+        let Some(tag @ ("drill" | "clearance" | "rect_delta" | "chamfer_ratio" | "chamfer")) =
+            clause.head()
+        else {
+            continue;
+        };
+        if !seen.insert(tag) {
+            bail!("duplicate pad clause '{tag}'");
+        }
+        match tag {
+            "drill" => {
+                let offsets = clause.find_all("offset");
+                match offsets.as_slice() {
+                    [] => {}
+                    [offset] => {
+                        let args = &clause.children().unwrap_or_default()[1..];
+                        let args = if args.first().and_then(SexpNode::as_str) == Some("oval") {
+                            &args[1..]
+                        } else {
+                            args
+                        };
+                        let count = args.iter().take_while(|arg| arg.head().is_none()).count();
+                        let undrilled = matches!(
+                            pad.get(2).and_then(SexpNode::as_str),
+                            Some("smd" | "connect")
+                        );
+                        if count > 2
+                            || (count == 0 && !undrilled)
+                            || args[..count].iter().any(|dimension| {
+                                dimension
+                                    .as_str()
+                                    .and_then(|atom| atom.parse::<f64>().ok())
+                                    .is_none_or(|mm| {
+                                        mm < 0.0 || pad_metadata_nm(mm, "drill size").is_err()
+                                    })
+                            })
+                            || args[count..].iter().any(|arg| arg.head().is_none())
+                        {
+                            bail!("drill with an offset must use valid dimensions before its nested clauses");
+                        }
+                        metadata.offset = pad_metadata_vector(offset, "drill offset")?;
+                    }
+                    _ => bail!("duplicate drill 'offset' clause"),
+                }
+            }
+            "clearance" => {
+                let value = pad_metadata_scalar(clause, tag)?;
+                let nm = pad_metadata_nm(value, tag)?;
+                if nm != 0 || file_version > super::solder_margins::ZERO_IS_INHERITED {
+                    metadata.clearance = Some(kiapi::common::types::Distance { value_nm: nm });
+                }
+            }
+            "rect_delta" => {
+                let delta = pad_metadata_vector(clause, tag)?;
+                if shape != "trapezoid" || (delta.x_nm != 0 && delta.y_nm != 0) {
+                    bail!("pad 'rect_delta' requires a trapezoid and at most one nonzero axis");
+                }
+                metadata.trapezoid_delta = Some(delta);
+            }
+            "chamfer_ratio" => {
+                metadata.chamfer_ratio = pad_metadata_scalar(clause, tag)?;
+                if !(0.0..=0.5).contains(&metadata.chamfer_ratio) {
+                    bail!("pad 'chamfer_ratio' must be between 0 and 0.5");
+                }
+            }
+            "chamfer" => {
+                let mut corners = kiapi::board::types::ChamferedRectCorners::default();
+                for corner in &clause.children().unwrap_or_default()[1..] {
+                    let flag = match corner.as_str() {
+                        Some("top_left") => &mut corners.top_left,
+                        Some("top_right") => &mut corners.top_right,
+                        Some("bottom_left") => &mut corners.bottom_left,
+                        Some("bottom_right") => &mut corners.bottom_right,
+                        _ => bail!("pad 'chamfer' contains an unknown corner"),
+                    };
+                    if std::mem::replace(flag, true) {
+                        bail!("pad 'chamfer' contains a duplicate corner");
+                    }
+                }
+                metadata.chamfered_corners = (corners != Default::default()).then_some(corners);
+            }
+            _ => unreachable!("pad metadata clauses are matched above"),
+        }
+    }
+    if shape == "trapezoid" {
+        // KiCad omits a zero delta from the file and includes it in IPC.
+        metadata
+            .trapezoid_delta
+            .get_or_insert_with(Default::default);
+    }
+    if metadata.chamfered_corners.is_some() || metadata.chamfer_ratio != 0.0 {
+        if shape != "roundrect" || !seen.contains("chamfer") || !seen.contains("chamfer_ratio") {
+            bail!("pad chamfering requires a roundrect with both 'chamfer_ratio' and 'chamfer'");
+        }
+        let rounding = pad.find_all("roundrect_rratio");
+        let [rounding] = rounding.as_slice() else {
+            bail!("chamfered roundrect requires exactly one 'roundrect_rratio'");
+        };
+        if !(0.0..=0.5).contains(&pad_metadata_scalar(rounding, "roundrect_rratio")?) {
+            bail!("pad 'roundrect_rratio' must be between 0 and 0.5");
+        }
+    }
+    Ok(metadata)
+}
+
+fn pad_metadata_scalar(clause: &SexpNode, tag: &str) -> Result<f64> {
+    clause
+        .get_f64(1)
+        .filter(|value| value.is_finite() && clause.children().is_some_and(|v| v.len() == 2))
+        .with_context(|| format!("pad '{tag}' must hold exactly one finite number"))
+}
+
+fn pad_metadata_vector(clause: &SexpNode, tag: &str) -> Result<kiapi::common::types::Vector2> {
+    let (Some(x), Some(y), Some([_, _, _])) =
+        (clause.get_f64(1), clause.get_f64(2), clause.children())
+    else {
+        bail!("pad '{tag}' must hold exactly two coordinates");
+    };
+    Ok(kiapi::common::types::Vector2 {
+        x_nm: pad_metadata_nm(x, tag)?,
+        y_nm: pad_metadata_nm(y, tag)?,
+    })
+}
+
+fn pad_metadata_nm(mm: f64, tag: &str) -> Result<i64> {
+    // KiCad board units are signed 32-bit nanometres. The symmetric bound
+    // also leaves room to negate a local Y coordinate during a flip.
+    if !(mm * 1e6).is_finite() || (mm * 1e6).round().abs() > f64::from(i32::MAX - 10) {
+        bail!("pad '{tag}' is outside KiCad's coordinate range");
+    }
+    Ok(copperpour_ipc::builders::mm_to_nm(mm))
+}
+
+/// Read the last annular-ring mode set by KiCad's file-order setters.
+fn pad_annular_mode(
+    pad: &SexpNode,
+) -> Result<Option<kiapi::board::types::UnconnectedLayerRemoval>> {
+    use kiapi::board::types::UnconnectedLayerRemoval;
+
+    let mut mode = None;
+    for clause in pad.children().unwrap_or_default().iter().skip(4) {
+        let Some(tag @ ("remove_unused_layers" | "keep_end_layers")) = clause.head() else {
+            continue;
+        };
+        let enabled = match clause.children().unwrap_or_default() {
+            [_] => true,
+            [_, value] if matches!(value.as_str(), Some("yes" | "true")) => true,
+            [_, value] if matches!(value.as_str(), Some("no" | "false")) => false,
+            _ => bail!("pad '{tag}' must be 'yes' or 'no'"),
+        };
+        mode = match (tag, enabled) {
+            ("remove_unused_layers", false) => None,
+            ("keep_end_layers", true) => Some(UnconnectedLayerRemoval::UlrRemoveExceptStartAndEnd),
+            _ => Some(UnconnectedLayerRemoval::UlrRemove),
+        };
+    }
+    Ok(mode)
+}
+
 fn check_pad(
     pad: &SexpNode,
     on_unsupported: &mut dyn FnMut(&str, &str) -> Result<()>,
@@ -1751,11 +1927,25 @@ fn check_pad(
         .get(3)
         .and_then(SexpNode::as_str)
         .context("footprint pad is missing its shape")?;
+    // KiCad saves a non-default annular-ring mode only for plated holes.
+    if pad.get(2).and_then(SexpNode::as_str) != Some("thru_hole")
+        && pad_annular_mode(pad)?.is_some()
+    {
+        on_unsupported(
+            "annular-ring removal on a non-plated-through-hole pad is not carried by typed placement",
+            "annular-ring removal on a non-plated-through-hole pad is not supported losslessly",
+        )?;
+    }
     // Placement, Update PCB and the refresh build and compare custom pads
     // through the shared model (#679); what it cannot carry is refused where
     // the pads are read (`extract_pad_definitions`).
     let custom = shape == "custom";
-    if !custom && !matches!(shape, "circle" | "rect" | "oval" | "roundrect") {
+    if !custom
+        && !matches!(
+            shape,
+            "circle" | "rect" | "oval" | "roundrect" | "trapezoid"
+        )
+    {
         on_unsupported(
             &format!("pad shape '{shape}' is not carried by typed placement"),
             &format!("pad shape '{shape}' is not supported by typed library refresh"),
@@ -1782,6 +1972,11 @@ fn check_pad(
                 | "uuid"
                 | "tstamp"
                 | "remove_unused_layers"
+                | "keep_end_layers"
+                | "rect_delta"
+                | "chamfer_ratio"
+                | "chamfer"
+                | "clearance"
                 | "property"
                 | "zone_connect"
                 | "thermal_bridge_width"
@@ -1795,18 +1990,9 @@ fn check_pad(
             )?;
             continue;
         }
-        if tag == "remove_unused_layers" {
-            let value = child.get(1).and_then(SexpNode::as_str);
-            if value != Some("no") {
-                on_unsupported(
-                    "pad 'remove_unused_layers yes' is not carried by typed placement",
-                    "pad 'remove_unused_layers yes' is not supported by typed library refresh",
-                )?;
-            }
-        }
         if tag == "drill" {
             for nested in child.children().unwrap_or_default().iter().skip(1) {
-                if nested.head().is_some() {
+                if nested.head().is_some_and(|tag| tag != "offset") {
                     on_unsupported(
                         "nested drill clauses are not carried by typed placement",
                         "nested drill clauses are not supported by typed library refresh",

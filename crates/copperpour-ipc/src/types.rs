@@ -349,6 +349,20 @@ pub struct IpcPadDefinition {
     pub roundrect_ratio: f64,
     /// A custom pad's anchor and primitives; `None` for every other shape.
     pub custom: Option<IpcCustomPadShape>,
+    pub metadata: IpcPadMetadata,
+}
+
+/// Native pad metadata carried by a normal (single copper geometry) padstack.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IpcPadMetadata {
+    /// Copper offset from the drill centre in unrotated pad-local coordinates.
+    pub offset: crate::gen::kiapi::common::types::Vector2,
+    pub trapezoid_delta: Option<crate::gen::kiapi::common::types::Vector2>,
+    pub chamfer_ratio: f64,
+    pub chamfered_corners: Option<crate::gen::kiapi::board::types::ChamferedRectCorners>,
+    /// None keeps the layer-removal mode at KiCad's default (keep all).
+    pub unconnected_layer_removal: Option<crate::gen::kiapi::board::types::UnconnectedLayerRemoval>,
+    pub clearance: Option<crate::gen::kiapi::common::types::Distance>,
 }
 
 /// A custom pad's anchor and primitives, in the pad's own millimetres:
