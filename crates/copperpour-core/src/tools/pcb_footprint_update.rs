@@ -7534,6 +7534,50 @@ mod tests {
         assert_eq!((pad.drill_x, pad.drill_y), (None, None));
     }
 
+    /// A back-side rebuild swaps each chamfered corner top for bottom, as
+    /// `PAD::Flip` does. No fixture chamfers a left-hand corner, so each corner
+    /// is set alone here.
+    #[test]
+    fn c2_pad_metadata_mirrors_each_chamfered_corner() {
+        let source = include_str!("../../tests/fixtures/issue_85_pad_chamfer.kicad_mod");
+        let mut pad = parse_library_footprint("Test:Chamfer", source)
+            .unwrap()
+            .pads[0]
+            .clone();
+        let corners = |tl, tr, bl, br| kiapi::board::types::ChamferedRectCorners {
+            top_left: tl,
+            top_right: tr,
+            bottom_left: bl,
+            bottom_right: br,
+        };
+        for (set, flipped) in [
+            (
+                corners(true, false, false, false),
+                corners(false, false, true, false),
+            ),
+            (
+                corners(false, true, false, false),
+                corners(false, false, false, true),
+            ),
+            (
+                corners(false, false, true, false),
+                corners(true, false, false, false),
+            ),
+            (
+                corners(false, false, false, true),
+                corners(false, true, false, false),
+            ),
+        ] {
+            pad.metadata.chamfered_corners = Some(set);
+            let mirrored = super::mirror_pad(&pad, two_layers()).unwrap();
+            assert_eq!(
+                mirrored.metadata.chamfered_corners,
+                Some(flipped),
+                "{set:?}"
+            );
+        }
+    }
+
     #[test]
     fn c2_pad_metadata_rejects_malformed_native_clauses() {
         for (fixture, from, to, diagnostic) in [
@@ -7578,6 +7622,18 @@ mod tests {
                 "(chamfer_ratio 0.3)",
                 "(chamfer_ratio NaN)",
                 "one finite number",
+            ),
+            (
+                include_str!("../../tests/fixtures/issue_85_pad_chamfer.kicad_mod"),
+                "(chamfer_ratio 0.3)",
+                "(chamfer_ratio 0.7)",
+                "'chamfer_ratio' must be between 0 and 0.5",
+            ),
+            (
+                include_str!("../../tests/fixtures/issue_85_pad_chamfer.kicad_mod"),
+                "(roundrect_rratio 0.02)",
+                "(roundrect_rratio 0.7)",
+                "'roundrect_rratio' must be between 0 and 0.5",
             ),
             (
                 include_str!("../../tests/fixtures/issue_85_pad_chamfer.kicad_mod"),
