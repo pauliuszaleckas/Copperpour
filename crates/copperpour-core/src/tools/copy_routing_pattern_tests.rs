@@ -371,7 +371,18 @@ async fn refuses_a_routing_item_without_readable_coordinates() {
 
     let result = call(&board.path, &issue_region()).await;
     assert!(result.is_error);
-    assert!(text_of(&result).contains(VIA_UUID), "{}", text_of(&result));
+    let reply = json_of(&result);
+    assert_eq!(reply["error"]["kind"], "malformed_file", "{reply}");
+    assert_eq!(reply["error"]["path"], board.path.display().to_string());
+    assert!(
+        reply["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains(VIA_UUID),
+        "{reply}"
+    );
+    let message = reply["message"].as_str().unwrap();
+    assert!(message.contains(VIA_UUID), "{reply}");
     assert_eq!(std::fs::read_to_string(&board.path).unwrap(), broken);
 }
 
@@ -420,7 +431,8 @@ fn a_board_changed_after_the_read_is_not_replaced() {
         dy: 5.08,
         net_map: Default::default(),
     };
-    let planned = plan_routing_copy(&board.original, &copy).expect("the fixture plans");
+    let planned =
+        plan_routing_copy(&board.path, &board.original, &copy).expect("the fixture plans");
     let newer = board.original.replacen("(width 0.25)", "(width 0.3)", 1);
     std::fs::write(&board.path, &newer).unwrap();
 

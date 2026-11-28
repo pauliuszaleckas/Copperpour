@@ -1469,12 +1469,16 @@ fn launch_kicad_ui_over_ssh_names_the_missing_display_and_takes_one() {
         json!({"project": project, "wait_ready": false}),
     );
     assert_eq!(bare["isError"], true, "{bare}");
-    let text = bare["content"][0]["text"].as_str().unwrap();
+    let body: Value = serde_json::from_str(bare["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["error"]["kind"], "editor_unavailable", "{body}");
+    assert_eq!(body["error"]["editor"], "kicad", "{body}");
+    let text = body["message"].as_str().unwrap();
+    assert_eq!(body["error"]["reason"], text, "{body}");
     assert!(
         text.contains("DISPLAY= WAYLAND_DISPLAY= GDK_BACKEND=wayland\n")
             && text.contains("Neither DISPLAY nor WAYLAND_DISPLAY is set")
             && text.contains("Pass display"),
-        "{text}"
+        "{body}"
     );
 
     let aimed = p.call_tool(
@@ -1482,10 +1486,14 @@ fn launch_kicad_ui_over_ssh_names_the_missing_display_and_takes_one() {
         json!({"project": project, "wait_ready": false, "display": ":0"}),
     );
     assert_eq!(aimed["isError"], true, "{aimed}");
-    let text = aimed["content"][0]["text"].as_str().unwrap();
+    let body: Value = serde_json::from_str(aimed["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["error"]["kind"], "editor_unavailable", "{body}");
+    assert_eq!(body["error"]["editor"], "kicad", "{body}");
+    let text = body["message"].as_str().unwrap();
+    assert_eq!(body["error"]["reason"], text, "{body}");
     assert!(
         text.ends_with("DISPLAY=:0 WAYLAND_DISPLAY=unset GDK_BACKEND=x11"),
-        "the display reaches KiCad, and no hint follows: {text}"
+        "the display reaches KiCad, and no hint follows: {body}"
     );
 }
 

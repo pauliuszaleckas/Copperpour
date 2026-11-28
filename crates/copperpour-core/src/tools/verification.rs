@@ -812,12 +812,15 @@ fn load_sibling_project(
 ) -> anyhow::Result<Result<(PathBuf, String, Value), CallToolResult>> {
     let project_path = sibling_project_path(board);
     if !project_path.exists() {
-        return Ok(Err(CallToolResult::error(format!(
-            "No project file at {} — Pre-defined Sizes live in the .kicad_pro, \
-             and a list written anywhere else is never read. Create the project \
-             (KiCad: File > Save a Copy, or place the board inside a project) and retry.",
-            project_path.display()
-        ))));
+        return Ok(Err(CallToolResult::error_kind(
+            ToolErrorKind::file_not_found(&project_path),
+            format!(
+                "No project file at {} — Pre-defined Sizes live in the .kicad_pro, \
+                 and a list written anywhere else is never read. Create the project \
+                 (KiCad: File > Save a Copy, or place the board inside a project) and retry.",
+                project_path.display()
+            ),
+        )));
     }
     let text = std::fs::read_to_string(&project_path)?;
     let settings: Value = serde_json::from_str(&text)
@@ -829,9 +832,10 @@ fn finite_positive(value: f64, field: &str) -> Result<f64, CallToolResult> {
     if value.is_finite() && value > 0.0 {
         Ok(value)
     } else {
-        Err(CallToolResult::error(format!(
-            "Argument '{field}' is invalid: must be a finite number greater than 0 mm, got {value}"
-        )))
+        Err(invalid_arg(
+            field,
+            &format!("must be a finite number greater than 0 mm, got {value}"),
+        ))
     }
 }
 
@@ -840,11 +844,9 @@ fn finite_positive(value: f64, field: &str) -> Result<f64, CallToolResult> {
 fn parse_track_widths(raw: &[Value]) -> Result<Vec<Value>, CallToolResult> {
     let mut out = vec![json!(0.0)];
     for (i, item) in raw.iter().enumerate() {
-        let width = item.as_f64().ok_or_else(|| {
-            CallToolResult::error(format!(
-                "Argument 'track_widths[{i}]' is invalid: missing or not a number"
-            ))
-        })?;
+        let width = item
+            .as_f64()
+            .ok_or_else(|| invalid_arg(&format!("track_widths[{i}]"), "missing or not a number"))?;
         if width == 0.0 {
             continue;
         }
@@ -862,19 +864,19 @@ fn parse_via_dimensions(raw: &[Value]) -> Result<Vec<Value>, CallToolResult> {
     let mut out = vec![json!({ "diameter": 0.0, "drill": 0.0 })];
     for (i, item) in raw.iter().enumerate() {
         let obj = item.as_object().ok_or_else(|| {
-            CallToolResult::error(format!(
-                "Argument 'via_dimensions[{i}]' is invalid: missing or not an object"
-            ))
+            invalid_arg(&format!("via_dimensions[{i}]"), "missing or not an object")
         })?;
         let diameter = obj.get("diameter").and_then(Value::as_f64).ok_or_else(|| {
-            CallToolResult::error(format!(
-                "Argument 'via_dimensions[{i}].diameter' is invalid: missing or not a number"
-            ))
+            invalid_arg(
+                &format!("via_dimensions[{i}].diameter"),
+                "missing or not a number",
+            )
         })?;
         let drill = obj.get("drill").and_then(Value::as_f64).ok_or_else(|| {
-            CallToolResult::error(format!(
-                "Argument 'via_dimensions[{i}].drill' is invalid: missing or not a number"
-            ))
+            invalid_arg(
+                &format!("via_dimensions[{i}].drill"),
+                "missing or not a number",
+            )
         })?;
         if diameter == 0.0 && drill == 0.0 {
             continue;
@@ -882,10 +884,10 @@ fn parse_via_dimensions(raw: &[Value]) -> Result<Vec<Value>, CallToolResult> {
         let diameter = finite_positive(diameter, &format!("via_dimensions[{i}].diameter"))?;
         let drill = finite_positive(drill, &format!("via_dimensions[{i}].drill"))?;
         if diameter <= drill {
-            return Err(CallToolResult::error(format!(
-                "Argument 'via_dimensions[{i}]' is invalid: diameter ({diameter} mm) \
-                 must be greater than drill ({drill} mm)"
-            )));
+            return Err(invalid_arg(
+                &format!("via_dimensions[{i}]"),
+                &format!("diameter ({diameter} mm) must be greater than drill ({drill} mm)"),
+            ));
         }
         let encoded = json!({ "diameter": diameter, "drill": drill });
         if !out.contains(&encoded) {
@@ -924,11 +926,7 @@ async fn handle_set_predefined_sizes(
             Ok(v) => Some(v),
             Err(e) => return Ok(e),
         },
-        Some(_) => {
-            return Ok(CallToolResult::error(
-                "Argument 'track_widths' is invalid: missing or not an array".to_string(),
-            ))
-        }
+        Some(_) => return Ok(invalid_arg("track_widths", "missing or not an array")),
     };
     let vias_arg = match args.get("via_dimensions") {
         None | Some(Value::Null) => None,
@@ -936,16 +934,12 @@ async fn handle_set_predefined_sizes(
             Ok(v) => Some(v),
             Err(e) => return Ok(e),
         },
-        Some(_) => {
-            return Ok(CallToolResult::error(
-                "Argument 'via_dimensions' is invalid: missing or not an array".to_string(),
-            ))
-        }
+        Some(_) => return Ok(invalid_arg("via_dimensions", "missing or not an array")),
     };
     if tracks_arg.is_none() && vias_arg.is_none() {
-        return Ok(CallToolResult::error(
-            "Argument 'track_widths' is invalid: name at least one of track_widths, via_dimensions"
-                .to_string(),
+        return Ok(invalid_arg(
+            "track_widths",
+            "name at least one of track_widths, via_dimensions",
         ));
     }
 
@@ -1205,6 +1199,16 @@ fn launch_display(args: &serde_json::Value) -> Result<Option<String>, CallToolRe
     Ok(Some(display.to_string()))
 }
 
+fn editor_unavailable(editor: &str, message: String) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::EditorUnavailable {
+            editor: editor.to_string(),
+            reason: message.clone(),
+        },
+        message,
+    )
+}
+
 async fn handle_launch_kicad_ui(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1236,17 +1240,17 @@ async fn handle_launch_kicad_ui(
     ) {
         Ok(kicad) => kicad,
         Err(e) => {
-            return Ok(CallToolResult::error(format!(
-                "Failed to launch KiCAD ({}): {}",
-                binary, e
-            )))
+            return Ok(editor_unavailable(
+                "kicad",
+                format!("Failed to launch KiCAD ({}): {}", binary, e),
+            ))
         }
     };
     // Its exit report then says the display is missing; this adds the remedy.
     kicad.on_no_display(
         "Pass display (for example \":0\") to open KiCad on the desktop's X display.",
     );
-    let exited = CallToolResult::error;
+    let exited = |message| editor_unavailable("kicad", message);
     // A new KiCad may bind a socket path a dead one used, leaving the candidate
     // set unchanged, so clear any ping backoff for follow-up calls (#32).
     ctx.reset_ipc_probe_backoff();
@@ -1790,9 +1794,10 @@ async fn open_board(
     ) {
         Ok(editor) => editor,
         Err(e) => {
-            return Ok(CallToolResult::error(format!(
-                "Failed to launch KiCad's PCB editor ({binary}): {e}"
-            )))
+            return Ok(editor_unavailable(
+                "pcb",
+                format!("Failed to launch KiCad's PCB editor ({binary}): {e}"),
+            ))
         }
     };
     editor.on_no_display(
@@ -1802,11 +1807,11 @@ async fn open_board(
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if let Err(message) = editor.watch(KICAD_IPC_POLL.min(remaining)).await {
-            return Ok(CallToolResult::error(message));
+            return Ok(editor_unavailable("pcb", message));
         }
         let seen = tokio::select! {
             seen = looking.look(&board, deadline) => seen,
-            message = editor.exited() => return Ok(CallToolResult::error(message)),
+            message = editor.exited() => return Ok(editor_unavailable("pcb", message)),
         };
         if let Some(answer) = call.found(ctx, &seen, true) {
             return Ok(answer);
@@ -1900,7 +1905,7 @@ async fn handle_copy_routing_pattern(
     }
     task::spawn_blocking(move || {
         let content = read_consistent(&board)?;
-        match plan_routing_copy(&content, &copy) {
+        match plan_routing_copy(&board, &content, &copy) {
             Ok(planned) => commit_routing_copy(&board, &content, &copy, &planned),
             Err(refusal) => Ok(refusal),
         }
@@ -1946,10 +1951,15 @@ fn identity_of(node: &SexpNode) -> Option<(&'static str, &str)> {
         .find_map(|tag| Some((tag, node.find_str(tag)?)))
 }
 
-fn unreadable(reason: String) -> CallToolResult {
-    CallToolResult::error(format!(
-        "Refusing to copy routing: {reason}. The board file was not modified."
-    ))
+fn unreadable(board: &Path, reason: String) -> CallToolResult {
+    let message = format!("Refusing to copy routing: {reason}. The board file was not modified.");
+    CallToolResult::error_kind(
+        ToolErrorKind::MalformedFile {
+            path: board.display().to_string(),
+            reason,
+        },
+        message,
+    )
 }
 
 /// Plan the copy of every top-level `segment`, `arc` and `via` whose defining
@@ -1958,15 +1968,17 @@ fn unreadable(reason: String) -> CallToolResult {
 /// subset of a track. An item whose points cannot be read refuses the whole
 /// copy, wherever it is: without them, whether it is in the region is unknown.
 pub(crate) fn plan_routing_copy(
+    board: &Path,
     content: &str,
     copy: &RoutingCopy,
 ) -> Result<PlannedCopy, CallToolResult> {
-    crate::tools::pcb_components::check_single_board_form(content).map_err(unreadable)?;
+    crate::tools::pcb_components::check_single_board_form(content)
+        .map_err(|reason| unreadable(board, reason))?;
     if !copy.net_map.is_empty() {
         // A destination net with no pads is a typo, not a net: KiCad would
         // create it and DRC would report the copy unconnected.
         let tree = parse_sexp(content)
-            .map_err(|e| unreadable(format!("the board does not parse: {e}")))?;
+            .map_err(|e| unreadable(board, format!("the board does not parse: {e}")))?;
         if !names_nets_in_place(&tree) {
             return Err(invalid_arg(
                 "net_map",
@@ -2007,10 +2019,10 @@ pub(crate) fn plan_routing_copy(
         let kind = ROUTING_KINDS[kind_index];
         // Copies go after the last routing item, where KiCad keeps them.
         insert_at = end;
-        let node =
-            parse_sexp(block).map_err(|e| unreadable(format!("a {kind} does not parse: {e}")))?;
+        let node = parse_sexp(block)
+            .map_err(|e| unreadable(board, format!("a {kind} does not parse: {e}")))?;
         let (identity_tag, id) =
-            identity_of(&node).ok_or_else(|| unreadable(format!("a {kind} has no uuid")))?;
+            identity_of(&node).ok_or_else(|| unreadable(board, format!("a {kind} has no uuid")))?;
         let points = defining_points(kind);
         let xys: Vec<(f64, f64)> = points
             .iter()
@@ -2020,10 +2032,13 @@ pub(crate) fn plan_routing_copy(
             })
             .collect::<Option<_>>()
             .ok_or_else(|| {
-                unreadable(format!(
-                    "{kind} {id} does not have exactly one readable ({}) point each",
-                    points.join(", ")
-                ))
+                unreadable(
+                    board,
+                    format!(
+                        "{kind} {id} does not have exactly one readable ({}) point each",
+                        points.join(", ")
+                    ),
+                )
             })?;
         if !xys.iter().any(inside) {
             continue;
@@ -2230,9 +2245,13 @@ async fn handle_check_clearance(
     };
     let mode = opt_str(args, "mode").unwrap_or("anchor");
     if !matches!(mode, "anchor" | "courtyard") {
-        return Ok(CallToolResult::error(format!(
-            "Invalid mode '{mode}'; expected 'anchor' or 'courtyard'"
-        )));
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "mode".to_string(),
+                reason: format!("expected 'anchor' or 'courtyard', got '{mode}'"),
+            },
+            format!("Invalid mode '{mode}'; expected 'anchor' or 'courtyard'"),
+        ));
     }
 
     // Prefer the exact unsaved board KiCad owns. Falling back only when the
@@ -3298,12 +3317,17 @@ mod kicad_launch_tests {
     const NOBODY: &str = "inproc://copperpour-core-764-nobody-listens";
 
     fn assert_reports_the_exit(text: &str) {
+        let body: Value = serde_json::from_str(text).expect("structured error JSON");
+        assert_eq!(body["error"]["kind"], "editor_unavailable", "{body}");
+        assert_eq!(body["error"]["editor"], "kicad", "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert_eq!(body["error"]["reason"], message, "{body}");
         assert!(
-            text.starts_with("KiCAD exited during startup")
-                && text.contains("255")
+            message.starts_with("KiCAD exited during startup")
+                && message.contains("255")
                 // The server's own lack of a display may follow it.
-                && text.contains("Error: Unable to initialize GTK+, is DISPLAY set properly?"),
-            "{text}"
+                && message.contains("Error: Unable to initialize GTK+, is DISPLAY set properly?"),
+            "{body}"
         );
     }
 
@@ -3344,11 +3368,16 @@ mod kicad_launch_tests {
         )
         .await;
         assert!(is_error, "{text}");
+        let body: Value = serde_json::from_str(&text).expect("structured error JSON");
+        assert_eq!(body["error"]["kind"], "editor_unavailable", "{body}");
+        assert_eq!(body["error"]["editor"], "kicad", "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert_eq!(body["error"]["reason"], message, "{body}");
         assert!(
-            text.starts_with("KiCAD exited during startup")
-                && text.contains("139")
-                && text.contains("Segmentation fault"),
-            "{text}"
+            message.starts_with("KiCAD exited during startup")
+                && message.contains("139")
+                && message.contains("Segmentation fault"),
+            "{body}"
         );
         // Let the abandoned ping finish, or the runtime waits out its receive
         // timeout on shutdown.
@@ -3549,7 +3578,12 @@ mod kicad_launch_tests {
         )
         .await;
         assert!(is_error, "{text}");
-        assert!(text.ends_with("DISPLAY=:42"), "{text}");
+        let body: Value = serde_json::from_str(&text).expect("structured error JSON");
+        assert_eq!(body["error"]["kind"], "editor_unavailable", "{body}");
+        assert_eq!(body["error"]["editor"], "kicad", "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert_eq!(body["error"]["reason"], message, "{body}");
+        assert!(message.ends_with("DISPLAY=:42"), "{body}");
     }
 
     #[tokio::test]
@@ -3990,10 +4024,15 @@ mod open_board_tests {
             .open_at(vec![unused_address("exits")], json!({}))
             .await;
         assert!(is_error, "{text}");
+        let refusal = body(&text);
+        assert_eq!(refusal["error"]["kind"], "editor_unavailable", "{refusal}");
+        assert_eq!(refusal["error"]["editor"], "pcb", "{refusal}");
+        let message = refusal["message"].as_str().unwrap();
+        assert_eq!(refusal["error"]["reason"], message, "{refusal}");
         assert!(
-            text.starts_with("KiCad's PCB editor exited during startup")
-                && text.contains("pcbnew: cannot open the board"),
-            "{text}"
+            message.starts_with("KiCad's PCB editor exited during startup")
+                && message.contains("pcbnew: cannot open the board"),
+            "{refusal}"
         );
     }
 
@@ -4032,10 +4071,15 @@ mod open_board_tests {
             )
             .await;
         assert!(is_error, "{text}");
+        let refusal = body(&text);
+        assert_eq!(refusal["error"]["kind"], "editor_unavailable", "{refusal}");
+        assert_eq!(refusal["error"]["editor"], "pcb", "{refusal}");
+        let message = refusal["message"].as_str().unwrap();
+        assert_eq!(refusal["error"]["reason"], message, "{refusal}");
         assert!(
-            text.starts_with("KiCad's PCB editor exited during startup")
-                && text.contains("pcbnew: lost the display"),
-            "{text}"
+            message.starts_with("KiCad's PCB editor exited during startup")
+                && message.contains("pcbnew: lost the display"),
+            "{refusal}"
         );
         while !answered.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4483,3 +4527,7 @@ mod drc_rule_filter_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "verification_error_kind_tests.rs"]
+mod error_kind_tests;
