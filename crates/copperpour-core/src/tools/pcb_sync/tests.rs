@@ -274,6 +274,7 @@ fn footprint_with_artwork(reference: &str) -> prost_types::Any {
             drill_oval: false,
             layers: vec!["F.Cu".to_string()],
             roundrect_ratio: 0.0,
+            metadata: Default::default(),
             custom: None,
         }],
         &[

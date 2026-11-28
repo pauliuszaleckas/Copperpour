@@ -346,6 +346,7 @@ fn update_item_changes_only_schematic_owned_fields() {
             drill_oval: false,
             layers: vec!["F.Cu".to_string()],
             roundrect_ratio: 0.0,
+            metadata: Default::default(),
             custom: None,
         }],
         &[],

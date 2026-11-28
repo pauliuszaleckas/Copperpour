@@ -76,6 +76,7 @@ enum ChangedDomain {
 #[derive(Debug)]
 struct PreparedUpdate {
     item: prost_types::Any,
+    expected_pads: Option<Vec<Vec<u8>>>,
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
     text_effects: Vec<FieldEffectsChange>,
@@ -337,6 +338,9 @@ struct PlannedUpdate {
     /// Not reported; post-commit readback compares observed state against this snapshot (#85).
     #[serde(skip)]
     before: kiapi::board::types::FootprintInstance,
+    /// Not reported; normalized pad definitions to confirm after a pad metadata update.
+    #[serde(skip)]
+    expected_pads: Option<Vec<Vec<u8>>>,
     /// Not reported; post-commit readback derives observed `preserved.pad_nets` from this.
     #[serde(skip)]
     old_nets: BTreeMap<String, kiapi::board::types::Net>,
@@ -532,8 +536,8 @@ pub(crate) async fn handle_update_footprints_from_library(
             })?;
             // Every apply verifies a fresh board readback rather than trusting
             // the request payload (#85): target KIID presence, footprint and
-            // child `parent` KIIDs, preserved instance state, and any reset
-            // text effects or net-tie pad groups.
+            // child `parent` KIIDs, preserved instance state, reset text
+            // effects, net-tie groups and pad metadata.
             let readback_footprints = match client
                 .get_items_in(readback_document, ObjectType::KotPcbFootprint)
             {
@@ -1287,6 +1291,7 @@ fn plan_updates(
                 text_effects: prepared.text_effects,
                 net_ties: library.net_ties.clone(),
                 before: candidate.instance,
+                expected_pads: prepared.expected_pads,
                 old_nets: prepared.old_nets,
             });
             prepared_items.push(prepared.item);
@@ -1505,6 +1510,12 @@ fn build_updated_instance(
         );
     }
 
+    use kiapi::board::types::{PadStackShape, UnconnectedLayerRemoval};
+
+    let mut verify_pads = library
+        .pads
+        .iter()
+        .any(|pad| pad.metadata != Default::default());
     let mut old_nets = BTreeMap::<String, kiapi::board::types::Net>::new();
     // The schematic pin each pad belongs to (pin function and type), which
     // Update PCB from Schematic writes and the library does not carry. KiCad's
@@ -1520,6 +1531,24 @@ fn build_updated_instance(
         }
         let pad = kiapi::board::types::Pad::decode(item.value.as_slice())
             .context("board footprint contains an invalid pad")?;
+        // Check removal as well as addition, including when other fields in
+        // the same footprint triggered the rebuild.
+        verify_pads |= pad.copper_clearance_override.is_some()
+            || pad.pad_stack.as_ref().is_some_and(|stack| {
+                matches!(
+                    stack.unconnected_layer_removal(),
+                    UnconnectedLayerRemoval::UlrRemove
+                        | UnconnectedLayerRemoval::UlrRemoveExceptStartAndEnd
+                ) || stack.copper_layers.iter().any(|layer| {
+                    layer
+                        .offset
+                        .is_some_and(|offset| offset != Default::default())
+                        || matches!(
+                            layer.shape(),
+                            PadStackShape::PssChamferedrect | PadStackShape::PssTrapezoid
+                        )
+                })
+            });
         if let Some(pin) = pad.symbol_pin.clone() {
             old_pins.entry(pad.number.clone()).or_insert(pin);
         }
@@ -1777,10 +1806,20 @@ fn build_updated_instance(
         definition.value_field = updated.value_field.clone();
     }
 
+    let expected_pads = if verify_pads {
+        let definition = updated
+            .definition
+            .as_ref()
+            .context("updated footprint has no definition")?;
+        Some(normalized_items(definition, "Pad")?)
+    } else {
+        None
+    };
     let changed_domains = changed_domains(current, &updated)?;
     let preserved = PreservedState::derive(current, &updated, &old_nets);
     Ok(PreparedUpdate {
         item: copperpour_ipc::builders::pack_any(&updated, "kiapi.board.types.FootprintInstance"),
+        expected_pads,
         changed_domains,
         preserved,
         text_effects,
@@ -1976,6 +2015,17 @@ fn verify_post_commit_readback(
                 change.reference,
                 mismatches.join("; ")
             ));
+        }
+        if let Some(expected) = &change.expected_pads {
+            let matches = observed.definition.as_ref().is_some_and(|definition| {
+                normalized_items(definition, "Pad").is_ok_and(|pads| &pads == expected)
+            });
+            if !matches {
+                return Err(format!(
+                    "updated footprint '{}' does not hold the planned pad definitions in post-commit readback",
+                    change.reference
+                ));
+            }
         }
         let observed_preserved = PreservedState::derive(&change.before, observed, &change.old_nets);
         let lost = change.preserved.lost_fields(&observed_preserved);
@@ -2285,6 +2335,15 @@ fn mirror_pad(
     let mut mirrored = pad.clone();
     mirrored.y = -mirrored.y;
     mirrored.rotation = -mirrored.rotation;
+    // PAD::Flip mirrors the same pad-local axis as the footprint position.
+    mirrored.metadata.offset.y_nm = -mirrored.metadata.offset.y_nm;
+    if let Some(delta) = &mut mirrored.metadata.trapezoid_delta {
+        delta.y_nm = -delta.y_nm;
+    }
+    if let Some(corners) = &mut mirrored.metadata.chamfered_corners {
+        std::mem::swap(&mut corners.top_left, &mut corners.bottom_left);
+        std::mem::swap(&mut corners.top_right, &mut corners.bottom_right);
+    }
     mirrored.layers = mirrored
         .layers
         .iter()
@@ -2934,20 +2993,12 @@ mod tests {
 
         // The same flags at a non-default value carry semantics the typed
         // rebuild cannot represent, so they refuse rather than silently drop.
-        for (from, to) in [
-            ("(embedded_fonts no)", "(embedded_fonts yes)"),
-            ("(remove_unused_layers no)", "(remove_unused_layers yes)"),
-        ] {
-            let flipped = source.replace(from, to);
-            assert_ne!(flipped, source, "fixture must contain {from}");
-            let error = parse_library_footprint("Konnect:Socket", &flipped)
-                .expect_err("a non-default flag must refuse")
-                .to_string();
-            assert!(
-                error.contains("not supported"),
-                "refusal names the unsupported clause: {error}"
-            );
-        }
+        let flipped = source.replace("(embedded_fonts no)", "(embedded_fonts yes)");
+        assert_ne!(flipped, source);
+        let error = parse_library_footprint("Konnect:Socket", &flipped)
+            .expect_err("embedded fonts must be refused")
+            .to_string();
+        assert!(error.contains("not supported"), "{error}");
     }
 
     #[test]
@@ -6742,6 +6793,7 @@ mod tests {
             text_effects: prepared.text_effects.clone(),
             net_ties: Vec::new(),
             before: applied.clone(),
+            expected_pads: None,
             old_nets: prepared.old_nets.clone(),
         };
         let unchanged = builders::pack_any(&applied, "kiapi.board.types.FootprintInstance");
@@ -7206,6 +7258,351 @@ mod tests {
             .find(|(capture, _)| *capture == reference)
             .unwrap();
         kiapi::board::types::FootprintInstance::decode(*bytes).unwrap()
+    }
+
+    const PAD_OFFSET_LIBRARY: &str =
+        include_str!("../../tests/fixtures/issue_85_pad_offset.kicad_mod");
+    const PAD_OFFSET_CAPTURE: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_85_pad_Q1.ipc.bin");
+
+    #[test]
+    fn c2_pad_metadata_matches_native_placements() {
+        // KiCad 10.0.8 IPC reads of stock footprints. The back placements
+        // use KiCad's top-bottom flip and a separate 37° rotation.
+        macro_rules! case {
+            ($fixture:literal, $reference:literal) => {
+                (
+                    include_str!(concat!(
+                        "../../tests/fixtures/issue_85_pad_",
+                        $fixture,
+                        ".kicad_mod"
+                    )),
+                    include_bytes!(concat!(
+                        "../../tests/fixtures/issue_85_pad_",
+                        $reference,
+                        ".ipc.bin"
+                    ))
+                    .as_slice(),
+                )
+            };
+        }
+
+        for (source, capture) in [
+            (PAD_OFFSET_LIBRARY, PAD_OFFSET_CAPTURE),
+            case!("offset", "Q10"),
+            case!("offset_smd", "U51"),
+            case!("clearance", "R1"),
+            case!("chamfer", "L1"),
+            case!("chamfer", "L10"),
+            case!("chamfer_defaults", "U52"),
+            case!("trapezoid", "D1"),
+            case!("trapezoid", "D10"),
+            case!("trapezoid_y", "U10"),
+            case!("trapezoid_zero", "D51"),
+            case!("annular", "J1"),
+        ] {
+            let current = decode_captured_footprint(capture);
+            let definition = current.definition.as_ref().unwrap();
+            let id = definition.id.as_ref().unwrap();
+            let lib_id = format!("{}:{}", id.library_nickname, id.entry_name);
+            let library = parse_library_footprint(&lib_id, source).unwrap();
+            let prepared = build_updated_instance(
+                &current,
+                &library,
+                CopperStack::new(4).unwrap(),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                Resets::default(),
+            )
+            .unwrap();
+            assert!(
+                !prepared.changed_domains.contains(&ChangedDomain::Pads),
+                "KiCad already placed the correct pads for {lib_id}"
+            );
+            assert_eq!(
+                prepared.expected_pads.unwrap(),
+                normalized_items(definition, "Pad").unwrap(),
+                "{lib_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn c2_pad_metadata_is_checked_after_served_apply() {
+        let library = PAD_OFFSET_LIBRARY.replacen("(offset 0 0.4)", "(offset 0.1 0.3)", 1);
+        let (_temp, board) = library_project("Package_TO_SOT_THT", "TO-92_HandSolder", &library);
+        for keeps_updates in [true, false] {
+            let mock = spawn_planner_mock_keeping(
+                &board,
+                vec![builders::pack_any(
+                    &decode_captured_footprint(PAD_OFFSET_CAPTURE),
+                    "kiapi.board.types.FootprintInstance",
+                )],
+                false,
+                keeps_updates,
+            );
+            let handler = served(mock.kicad.address()).await;
+            let request = serde_json::json!({ "board": board });
+            let plan = result_json(&served_call(&handler, request.clone()).await);
+            assert_eq!(plan["status"], "ready", "{plan}");
+            assert_eq!(
+                plan["changes"][0]["changed_domains"],
+                serde_json::json!(["pads"])
+            );
+            let result = served_call(
+                &handler,
+                serde_json::json!({
+                    "board": board,
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                }),
+            )
+            .await;
+            let body = result_json(&result);
+            if keeps_updates {
+                assert_eq!(body["status"], "applied", "{body}");
+                let next = result_json(&served_call(&handler, request).await);
+                assert_eq!(next["status"], "noop", "{next}");
+            } else {
+                assert_eq!(
+                    body["error"]["kind"], "mutation_outcome_uncertain",
+                    "{body}"
+                );
+                assert!(body["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("planned pad definitions"));
+            }
+            let capture = mock.capture.lock().unwrap();
+            assert_eq!(capture.update_batches, [1]);
+            let sent = decode_captured_footprint(&capture.updated_items[0][0].value);
+            let pad = decoded_pads(&sent)
+                .into_iter()
+                .find(|pad| pad.number == "1")
+                .unwrap();
+            assert_eq!(
+                pad.pad_stack.unwrap().copper_layers[0].offset,
+                Some(builders::vec2(0.1, 0.3))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn c2_pad_metadata_detects_unapplied_additions_and_removals() {
+        let original = decode_captured_footprint(PAD_OFFSET_CAPTURE);
+        let mut cleared = original.clone();
+        for item in &mut cleared.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.pad_stack.as_mut().unwrap().copper_layers[0].offset = Some(Default::default());
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+        }
+        let without = PAD_OFFSET_LIBRARY
+            .replace("(offset 0 0.4)", "")
+            .replace("(offset 0 -0.4)", "");
+        for (source, before) in [(PAD_OFFSET_LIBRARY, cleared), (&without, original)] {
+            let (_temp, board) = library_project("Package_TO_SOT_THT", "TO-92_HandSolder", source);
+            let mock = spawn_planner_mock_keeping(
+                &board,
+                vec![builders::pack_any(
+                    &before,
+                    "kiapi.board.types.FootprintInstance",
+                )],
+                false,
+                false,
+            );
+            let handler = served(mock.kicad.address()).await;
+            let plan =
+                result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+            assert_eq!(plan["status"], "ready", "{plan}");
+            let applied = result_json(
+                &served_call(
+                    &handler,
+                    serde_json::json!({
+                        "board": board,
+                        "dry_run": false,
+                        "expected_plan_revision": plan["plan_revision"],
+                    }),
+                )
+                .await,
+            );
+            assert_eq!(
+                applied["error"]["kind"], "mutation_outcome_uncertain",
+                "{applied}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn c2_pad_metadata_refuses_unsupported_drill_before_ipc_write() {
+        let library = PAD_OFFSET_LIBRARY.replacen("(offset 0 0.4)", "(offset 0 0.4) (future 1)", 1);
+        let (_temp, board) = library_project("Package_TO_SOT_THT", "TO-92_HandSolder", &library);
+        let mock = spawn_planner_mock(
+            &board,
+            builders::pack_any(
+                &decode_captured_footprint(PAD_OFFSET_CAPTURE),
+                "kiapi.board.types.FootprintInstance",
+            ),
+            false,
+        );
+        let handler = served(mock.kicad.address()).await;
+        let plan = result_json(&served_call(&handler, serde_json::json!({ "board": board })).await);
+        assert_eq!(plan["status"], "conflict", "{plan}");
+        assert_eq!(
+            plan["diagnostics"][0]["code"],
+            "unsupported_library_footprint"
+        );
+        assert!(plan["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nested drill"));
+        assert!(mock.capture.lock().unwrap().update_batches.is_empty());
+    }
+
+    #[test]
+    fn c2_pad_metadata_preserves_clearance_presence_and_annular_modes() {
+        use kiapi::board::types::UnconnectedLayerRemoval;
+
+        let source = include_str!("../../tests/fixtures/issue_85_pad_clearance.kicad_mod");
+        let zero = source.replace("(clearance 0.35)", "(clearance 0)");
+        for (source, expected) in [
+            (zero.clone(), Some(0)),
+            (
+                zero.replace("(version 20260206)", "(version 20240201)"),
+                None,
+            ),
+        ] {
+            let library = parse_library_footprint("Test:Clearance", &source).unwrap();
+            assert_eq!(
+                library.pads[0].metadata.clearance.map(|c| c.value_nm),
+                expected
+            );
+        }
+
+        let source = include_str!("../../tests/fixtures/issue_85_pad_annular.kicad_mod");
+        for (clauses, expected) in [
+            (
+                "(remove_unused_layers yes)",
+                Some(UnconnectedLayerRemoval::UlrRemove),
+            ),
+            ("(keep_end_layers yes) (remove_unused_layers no)", None),
+            (
+                "(remove_unused_layers true) (keep_end_layers false)",
+                Some(UnconnectedLayerRemoval::UlrRemove),
+            ),
+            (
+                "(remove_unused_layers) (keep_end_layers)",
+                Some(UnconnectedLayerRemoval::UlrRemoveExceptStartAndEnd),
+            ),
+        ] {
+            let modified = source.replace(
+                "(remove_unused_layers yes)\n\t\t(keep_end_layers yes)",
+                clauses,
+            );
+            assert_ne!(source, modified);
+            let library = parse_library_footprint("Test:Annular", &modified).unwrap();
+            assert!(library
+                .pads
+                .iter()
+                .all(|pad| pad.metadata.unconnected_layer_removal == expected));
+        }
+    }
+
+    #[test]
+    fn c2_pad_metadata_refuses_annular_removal_for_surface_mount() {
+        let source = include_str!("../../tests/fixtures/issue_85_pad_clearance.kicad_mod")
+            .replace("(clearance 0.35)", "(clearance 0.35) (keep_end_layers yes)");
+        let error = parse_library_footprint("Test:Fiducial", &source).unwrap_err();
+        assert!(format!("{error:#}").contains("non-plated-through-hole pad"));
+        let root = copperpour_sexp::parse_sexp(&source).unwrap();
+        assert!(super::super::library_footprint::unsupported_features(&root)
+            .unwrap()
+            .iter()
+            .any(|warning| warning.contains("non-plated-through-hole pad")));
+        let pad = &super::super::pcb_components::extract_pad_definitions(&source).unwrap()[0];
+        assert_eq!(pad.metadata.unconnected_layer_removal, None);
+    }
+
+    #[test]
+    fn c2_pad_metadata_ignores_drill_size_on_offset_smd_pads() {
+        let source = include_str!("../../tests/fixtures/issue_85_pad_offset_smd.kicad_mod")
+            .replacen("(drill", "(drill oval 0.75 1", 1);
+        let library = parse_library_footprint("Test:Offset", &source).unwrap();
+        let pad = &library.pads[0];
+        assert_eq!(pad.metadata.offset, builders::vec2(0.0, 0.266));
+        assert_eq!((pad.drill_x, pad.drill_y), (None, None));
+    }
+
+    #[test]
+    fn c2_pad_metadata_rejects_malformed_native_clauses() {
+        for (fixture, from, to, diagnostic) in [
+            (
+                PAD_OFFSET_LIBRARY,
+                "(drill 0.75",
+                "(drill 0.75 invalid",
+                "valid dimensions",
+            ),
+            (
+                PAD_OFFSET_LIBRARY,
+                "(offset 0 0.4)",
+                "(offset 0 inf)",
+                "coordinate range",
+            ),
+            (
+                PAD_OFFSET_LIBRARY,
+                "(offset 0 0.4)",
+                "(offset 0)",
+                "two coordinates",
+            ),
+            (
+                PAD_OFFSET_LIBRARY,
+                "(offset 0 0.4)",
+                "(offset 0 0.4) (offset 0 0.5)",
+                "duplicate drill",
+            ),
+            (
+                include_str!("../../tests/fixtures/issue_85_pad_trapezoid.kicad_mod"),
+                "(rect_delta 1 0)",
+                "(rect_delta 1 1)",
+                "one nonzero axis",
+            ),
+            (
+                include_str!("../../tests/fixtures/issue_85_pad_chamfer.kicad_mod"),
+                "(chamfer bottom_right)",
+                "(chamfer bottom_right future)",
+                "unknown corner",
+            ),
+            (
+                include_str!("../../tests/fixtures/issue_85_pad_chamfer.kicad_mod"),
+                "(chamfer_ratio 0.3)",
+                "(chamfer_ratio NaN)",
+                "one finite number",
+            ),
+            (
+                include_str!("../../tests/fixtures/issue_85_pad_chamfer.kicad_mod"),
+                "(roundrect_rratio 0.02)",
+                "(roundrect_rratio 0) (roundrect_rratio 0.02)",
+                "exactly one 'roundrect_rratio'",
+            ),
+            (
+                include_str!("../../tests/fixtures/issue_85_pad_clearance.kicad_mod"),
+                "(clearance 0.35)",
+                "(clearance 0.35) (clearance 0.1)",
+                "duplicate pad clause",
+            ),
+            (
+                include_str!("../../tests/fixtures/issue_85_pad_annular.kicad_mod"),
+                "(keep_end_layers yes)",
+                "(keep_end_layers maybe)",
+                "must be 'yes' or 'no'",
+            ),
+        ] {
+            let source = fixture.replacen(from, to, 1);
+            assert_ne!(source, fixture, "{from}");
+            let err = parse_library_footprint("Test:Pad", &source).unwrap_err();
+            assert!(format!("{err:#}").contains(diagnostic), "{err:#}");
+        }
     }
 
     /// KiCad 10.0.8's own placement of stock footprints with custom pads
@@ -8085,12 +8482,9 @@ mod tests {
                 library.into_iter().zip(reported)
             {
                 assert_eq!(number, reported_number, "{reference}");
-                // Refresh refuses custom and trapezoid pads, whose default
-                // angle KiCad's parser and API don't agree on.
-                if [PadStackShape::PssCustom, PadStackShape::PssTrapezoid]
-                    .iter()
-                    .any(|other| *other as i32 == shape)
-                {
+                // Custom pads use the anchor shape to select their default,
+                // which this helper does not read.
+                if shape == PadStackShape::PssCustom as i32 {
                     continue;
                 }
                 assert_eq!(

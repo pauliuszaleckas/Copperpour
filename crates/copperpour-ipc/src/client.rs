@@ -5431,6 +5431,12 @@ impl KiCadIpcClient {
                     "rect" => kiapi::board::types::PadStackShape::PssRectangle,
                     "oval" => kiapi::board::types::PadStackShape::PssOval,
                     "trapezoid" => kiapi::board::types::PadStackShape::PssTrapezoid,
+                    "roundrect"
+                        if pad.metadata.chamfer_ratio > 0.0
+                            || pad.metadata.chamfered_corners.is_some() =>
+                    {
+                        kiapi::board::types::PadStackShape::PssChamferedrect
+                    }
                     "roundrect" => kiapi::board::types::PadStackShape::PssRoundrect,
                     "chamfered_rect" => kiapi::board::types::PadStackShape::PssChamferedrect,
                     _ => kiapi::board::types::PadStackShape::PssRectangle,
@@ -5468,7 +5474,10 @@ impl KiCadIpcClient {
                     corner_rounding_ratio: pad.roundrect_ratio,
                     custom_anchor_shape: anchor as i32,
                     custom_shapes,
-                    offset: Some(crate::builders::vec2(0.0, 0.0)),
+                    offset: Some(pad.metadata.offset),
+                    trapezoid_delta: pad.metadata.trapezoid_delta,
+                    chamfer_ratio: pad.metadata.chamfer_ratio,
+                    chamfered_corners: pad.metadata.chamfered_corners,
                     ..Default::default()
                 };
                 let drill = pad
@@ -5491,7 +5500,10 @@ impl KiCadIpcClient {
                     r#type: kiapi::board::types::PadStackType::PstNormal as i32,
                     layers,
                     drill,
-                    unconnected_layer_removal: kiapi::board::types::UnconnectedLayerRemoval::UlrKeep
+                    unconnected_layer_removal: pad
+                        .metadata
+                        .unconnected_layer_removal
+                        .unwrap_or(kiapi::board::types::UnconnectedLayerRemoval::UlrKeep)
                         as i32,
                     copper_layers: vec![copper],
                     angle: Some(kiapi::common::types::Angle {
@@ -5509,6 +5521,7 @@ impl KiCadIpcClient {
                     number: pad.number.clone(),
                     r#type: pad_type as i32,
                     pad_stack: Some(stack),
+                    copper_clearance_override: pad.metadata.clearance,
                     position: Some(crate::builders::vec2(board_x, board_y)),
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
                     ..Default::default()
@@ -8667,6 +8680,7 @@ mod footprint_graphics_tests {
             drill_y: None,
             drill_oval: false,
             roundrect_ratio: 0.0,
+            metadata: Default::default(),
             custom: None,
             rotation: 0.0,
         };
@@ -8818,6 +8832,7 @@ mod footprint_graphics_tests {
             drill_y: None,
             drill_oval: false,
             roundrect_ratio: 0.0,
+            metadata: Default::default(),
             custom: None,
             rotation: 0.0,
         }];

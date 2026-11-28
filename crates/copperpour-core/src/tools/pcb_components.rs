@@ -253,6 +253,7 @@ pub(crate) fn extract_pad_definitions(
     source: &str,
 ) -> anyhow::Result<Vec<copperpour_ipc::IpcPadDefinition>> {
     let footprint = copperpour_sexp::parse_sexp(source)?;
+    let file_version = super::solder_margins::file_version(&footprint);
     footprint
         .find_all("pad")
         .into_iter()
@@ -262,12 +263,13 @@ pub(crate) fn extract_pad_definitions(
                     .and_then(copperpour_sexp::SexpNode::as_str)
                     .ok_or_else(|| anyhow::anyhow!("footprint pad is missing {label}"))
             };
+            let number = required(1, "number")?;
+            let pad_type = required(2, "type")?;
             let shape = required(3, "shape")?.to_string();
             // A custom pad's anchor and primitives through the shared model
             // (#679); what KiCad's pad message cannot carry is refused with
             // the pad named.
             let custom = if shape == "custom" {
-                let number = required(1, "number")?;
                 let custom = super::pad_primitives::CustomPadShape::from_pad(pad)
                     .and_then(|custom| custom.to_ipc())
                     .map_err(|reason| anyhow::anyhow!("custom pad '{number}': {reason}"))?;
@@ -292,6 +294,13 @@ pub(crate) fn extract_pad_definitions(
                 .map(str::to_string)
                 .collect();
             let (drill_x, drill_y, drill_oval) = match pad.find("drill") {
+                // KiCad files the copper offset under drill, even on pads
+                // for which its native parser discards the drill dimensions.
+                Some(drill)
+                    if matches!(pad_type, "smd" | "connect") && drill.find("offset").is_some() =>
+                {
+                    (None, None, false)
+                }
                 Some(drill)
                     if drill.get(1).and_then(copperpour_sexp::SexpNode::as_str) == Some("oval") =>
                 {
@@ -308,9 +317,11 @@ pub(crate) fn extract_pad_definitions(
                 ),
                 None => (None, None, false),
             };
+            let metadata = super::library_footprint::pad_metadata(pad, &shape, file_version)
+                .map_err(|error| anyhow::anyhow!("pad '{number}': {error:#}"))?;
             Ok(copperpour_ipc::IpcPadDefinition {
-                number: required(1, "number")?.to_string(),
-                pad_type: required(2, "type")?.to_string(),
+                number: number.to_string(),
+                pad_type: pad_type.to_string(),
                 shape,
                 x: at
                     .get_f64(1)
@@ -329,6 +340,7 @@ pub(crate) fn extract_pad_definitions(
                 drill_y,
                 drill_oval,
                 custom,
+                metadata,
                 layers,
                 roundrect_ratio: pad.find_f64("roundrect_rratio").unwrap_or(0.0),
             })
@@ -4410,6 +4422,16 @@ async fn handle_repair_corrupted_footprints(
                     }
                 }
 
+                if summary.layer == "B.Cu"
+                    && pads.iter().any(|pad| pad.metadata != Default::default())
+                {
+                    diagnostics.push(json!({
+                        "reference": reference,
+                        "code": "unsupported_library_footprint",
+                        "message": "repair cannot rebuild this back-side footprint's library pad metadata losslessly"
+                    }));
+                    continue;
+                }
                 let mut clean = KiCadIpcClient::build_footprint_item(
                     &summary.footprint,
                     &summary.reference,
@@ -11617,6 +11639,7 @@ mod nanometre_rounding_tests {
     /// reference, the board KiCad answers `SaveDocumentToString` with.
     async fn corrupted_footprint_kicad(
         saved: Option<fn(&str) -> String>,
+        fixture: Option<(&str, &[u8])>,
     ) -> (
         tempfile::TempDir,
         std::path::PathBuf,
@@ -11630,19 +11653,16 @@ mod nanometre_rounding_tests {
         use copperpour_ipc::gen::kiapi::board::types::{FootprintInstance, Pad};
         use std::sync::{Arc, Mutex};
 
-        let dir = tempfile::tempdir().unwrap();
-        let (board, lib_id) = issue_318_fixture(
-            dir.path(),
-            "Package_SON",
-            "WSON-6-1EP_2x2mm_P0.65mm_EP1x1.6mm_ThermalVias",
+        let (source, capture) = fixture.unwrap_or((
             include_str!("../../tests/fixtures/issue_300_wson6_thermalvias_kicad10.kicad_mod"),
-        );
-        // Build a corrupted U4 from the oracle by turning one BoardGraphicShape
-        // into an anonymous layerless Pad (issue #244 signature).
-        let mut corrupted = FootprintInstance::decode(
             include_bytes!("../../tests/fixtures/issue_300_u2.ipc.bin").as_slice(),
-        )
-        .unwrap();
+        ));
+        // Introduce issue #244's corruption into the native footprint capture.
+        let mut corrupted = FootprintInstance::decode(capture).unwrap();
+        let id = corrupted.definition.as_ref().unwrap().id.as_ref().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (board, _) =
+            issue_318_fixture(dir.path(), &id.library_nickname, &id.entry_name, source);
         corrupted.id = Some(copperpour_ipc::gen::kiapi::common::types::Kiid {
             value: "fp-u4".to_string(),
         });
@@ -11699,8 +11719,52 @@ mod nanometre_rounding_tests {
         })
         .await
         .unwrap();
-        let _ = lib_id;
         (dir, board, store, server, handler)
+    }
+
+    #[tokio::test]
+    async fn c2_pad_metadata_back_side_repair_refuses_before_mutation() {
+        let fixture = include_str!("../../tests/fixtures/issue_85_pad_offset.kicad_mod");
+        for (capture, expected_status) in [
+            (
+                include_bytes!("../../tests/fixtures/issue_85_pad_Q1.ipc.bin").as_slice(),
+                "ready",
+            ),
+            (
+                include_bytes!("../../tests/fixtures/issue_85_pad_Q10.ipc.bin").as_slice(),
+                "conflict",
+            ),
+        ] {
+            let (_dir, board, store, _server, handler) =
+                corrupted_footprint_kicad(None, Some((fixture, capture))).await;
+            let before = store.lock().unwrap().items.clone();
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repair_corrupted_footprints",
+                        "arguments": { "board": board, "dry_run": true }
+                    }
+                }))
+                .await
+                .unwrap();
+            let result: serde_json::Value = serde_json::from_str(
+                response.result.unwrap()["content"][0]["text"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(result["status"], expected_status, "{result}");
+            if expected_status == "conflict" {
+                assert_eq!(
+                    result["diagnostics"][0]["code"],
+                    "unsupported_library_footprint"
+                );
+            }
+            assert_eq!(store.lock().unwrap().items, before);
+        }
     }
 
     #[tokio::test]
@@ -11710,7 +11774,7 @@ mod nanometre_rounding_tests {
             Pad, PadFabricationProperty, ZoneConnectionStyle,
         };
 
-        let (_dir, board, store, _server, handler) = corrupted_footprint_kicad(None).await;
+        let (_dir, board, store, _server, handler) = corrupted_footprint_kicad(None, None).await;
         let dry = handler
             .handle_message(json!({
                 "jsonrpc": "2.0",
@@ -11944,7 +12008,8 @@ mod nanometre_rounding_tests {
                  (members))\n\t)\n)\n"
             )
         }
-        let (_dir, board, store, _server, handler) = corrupted_footprint_kicad(Some(grouped)).await;
+        let (_dir, board, store, _server, handler) =
+            corrupted_footprint_kicad(Some(grouped), None).await;
         let dry = handler
             .handle_message(json!({
                 "jsonrpc": "2.0",
